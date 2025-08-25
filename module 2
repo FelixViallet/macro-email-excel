@@ -1,0 +1,127 @@
+Option Explicit
+
+' === Utilitaires généraux ===
+Public Function LastUsedRowIn(ws As Worksheet) As Long
+    Dim c As Range
+    On Error Resume Next
+    Set c = ws.Cells.Find(What:="*", LookIn:=xlFormulas, LookAt:=xlPart, _
+                          SearchOrder:=xlByRows, SearchDirection:=xlPrevious)
+    On Error GoTo 0
+    If c Is Nothing Then LastUsedRowIn = 0 Else LastUsedRowIn = c.Row
+End Function
+
+Public Function SliceRow(ByVal arrRow As Variant, ByVal startCol As Long, ByVal endCol As Long) As Variant
+    Dim i As Long, n As Long, tmp As Variant
+    n = endCol - startCol + 1
+    ReDim tmp(1 To 1, 1 To n)
+    For i = 1 To n
+        tmp(1, i) = arrRow(1, startCol + i - 1)
+    Next i
+    SliceRow = tmp
+End Function
+
+Public Sub AddToDict(ByVal dict As Object, ByVal key As String, ByVal arrRow As Variant)
+    If Not dict.Exists(key) Then dict.Add key, New Collection
+    dict(key).Add arrRow
+End Sub
+
+Public Sub AppendBlock(ws As Worksheet, ByVal firstRow As Long, ByVal firstCol As String, ByVal lastCol As String, ByVal dataColl As Collection)
+    Dim n As Long, m As Long, nextRow As Long, lastExist As Long
+    n = dataColl.Count: If n = 0 Then Exit Sub
+    m = ws.Range(firstCol & "1:" & lastCol & "1").Columns.Count
+    lastExist = ws.Cells(ws.Rows.Count, firstCol).End(xlUp).Row
+    If lastExist < firstRow Then nextRow = firstRow Else nextRow = lastExist + 1
+    
+    Dim outArr As Variant, i As Long, j As Long, rowArr As Variant
+    ReDim outArr(1 To n, 1 To m)
+    For i = 1 To n
+        rowArr = dataColl(i)
+        For j = 1 To m
+            outArr(i, j) = rowArr(1, j)
+        Next j
+    Next i
+    ws.Range(firstCol & nextRow).Resize(n, m).Value = outArr
+End Sub
+
+' === Gestion des sections par en-tête (colonne B) - écriture en C:U ===
+Public Sub AppendInSection(ws As Worksheet, ByVal headerText As String, ByVal rowsColl As Collection)
+    ' Objectif:
+    ' - Trouver la ligne d'en-tête (col B = headerText, insensible à la casse). Sinon, créer à la fin.
+    ' - Déterminer la section = de (hdrRow+1) jusqu'à avant le prochain en-tête (prochaine cellule non vide en col B).
+    ' - Appendre les données en C:U juste après la dernière ligne non vide de la section, sans Insert.
+    If rowsColl Is Nothing Or rowsColl.Count = 0 Then Exit Sub
+    
+    Dim hdrRow As Long, nextHdrRow As Long, sectionStart As Long, sectionEnd As Long
+    hdrRow = FindHeaderRow(ws, headerText)
+    
+    If hdrRow = 0 Then
+        hdrRow = LastUsedRowIn(ws) + 1
+        If hdrRow < 1 Then hdrRow = 1
+        ws.Cells(hdrRow, "B").Value = headerText
+    End If
+    
+    sectionStart = hdrRow + 1
+    nextHdrRow = FindNextHeaderRow(ws, hdrRow + 1)
+    If nextHdrRow = 0 Then
+        sectionEnd = ws.Rows.Count
+    Else
+        sectionEnd = nextHdrRow - 1
+    End If
+    If sectionStart > sectionEnd Then sectionEnd = sectionStart
+    
+    Dim lastUsedInSection As Long, nextRow As Long
+    lastUsedInSection = LastUsedInColumnBetween(ws, "C", sectionStart, sectionEnd)
+    If lastUsedInSection < sectionStart Then
+        nextRow = sectionStart
+    Else
+        nextRow = lastUsedInSection + 1
+    End If
+    
+    Dim n As Long, m As Long, i As Long, j As Long, outArr As Variant, rowArr As Variant
+    n = rowsColl.Count: m = 19   ' C:U
+    ReDim outArr(1 To n, 1 To m)
+    For i = 1 To n
+        rowArr = SliceRow(rowsColl(i), 3, 21) ' prendre C:U depuis la ligne source A:U
+        For j = 1 To m
+            outArr(i, j) = rowArr(1, j)
+        Next j
+    Next i
+    
+    ws.Range("C" & nextRow).Resize(n, m).Value = outArr
+End Sub
+
+Public Function FindHeaderRow(ws As Worksheet, ByVal headerText As String) As Long
+    Dim c As Range
+    On Error Resume Next
+    Set c = ws.Range("B:B").Find(What:=headerText, LookIn:=xlValues, LookAt:=xlWhole, _
+                                 SearchOrder:=xlByRows, SearchDirection:=xlNext, MatchCase:=False)
+    On Error GoTo 0
+    If Not c Is Nothing Then FindHeaderRow = c.Row Else FindHeaderRow = 0
+End Function
+
+Public Function FindNextHeaderRow(ws As Worksheet, ByVal startRow As Long) As Long
+    ' Cherche la prochaine cellule non vide en col B à partir de startRow
+    Dim lastR As Long, r As Long
+    lastR = LastUsedRowIn(ws)
+    If startRow > lastR Then FindNextHeaderRow = 0: Exit Function
+    For r = startRow To lastR
+        If LenB(ws.Cells(r, "B").Value2) > 0 Then
+            FindNextHeaderRow = r
+            Exit Function
+        End If
+    Next r
+    FindNextHeaderRow = 0
+End Function
+
+Public Function LastUsedInColumnBetween(ws As Worksheet, ByVal colLetter As String, ByVal rStart As Long, ByVal rEnd As Long) As Long
+    ' De bas en haut, dernière cellule non vide dans [rStart, rEnd] pour la colonne colLetter
+    Dim r As Long
+    If rEnd < rStart Then LastUsedInColumnBetween = 0: Exit Function
+    For r = rEnd To rStart Step -1
+        If LenB(ws.Cells(r, colLetter).Value2) > 0 Then
+            LastUsedInColumnBetween = r
+            Exit Function
+        End If
+    Next r
+    LastUsedInColumnBetween = 0
+End Function

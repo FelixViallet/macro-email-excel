@@ -1,0 +1,105 @@
+Option Explicit
+
+Public Sub MTN_TAPS_Dispatch()
+    Dim wb As Workbook
+    Dim wsSrc As Worksheet, wsArch As Worksheet, wsWk As Worksheet, wsFinal As Worksheet
+    Dim r As Long, lastRow As Long
+    Dim arrRow As Variant
+    Dim listArch As Collection, listWk As Collection
+    Dim dictCur As Object, dictBarc As Object
+    Dim key As Variant
+    Dim hasBarc As Boolean, colA As String, cur As String, colS As String
+    
+    Set wb = ThisWorkbook
+    On Error GoTo ErrSheets
+    Set wsSrc = wb.Worksheets("MTN and TAPS")
+    Set wsArch = wb.Worksheets("archive kills")
+    Set wsWk = wb.Worksheets("WEEKLY CREDIT PPs")
+    Set wsFinal = wb.Worksheets("MTN and TAPS final")
+    On Error GoTo 0
+    
+    ' Perf
+    Dim prevScr As Boolean, prevCalc As XlCalculation, prevEvents As Boolean
+    prevScr = Application.ScreenUpdating: Application.ScreenUpdating = False
+    prevCalc = Application.Calculation: Application.Calculation = xlCalculationManual
+    prevEvents = Application.EnableEvents: Application.EnableEvents = False
+    On Error GoTo CleanFail
+    
+    ' Bornes
+    lastRow = LastUsedRowIn(wsSrc)
+    If lastRow < 6 Then GoTo CleanExit
+    
+    ' Buffers
+    Set listArch = New Collection
+    Set listWk = New Collection
+    Set dictCur = CreateObject("Scripting.Dictionary")
+    Set dictBarc = CreateObject("Scripting.Dictionary")
+    
+    ' Parcours source A:U à partir de 6
+    For r = 6 To lastRow
+        If Application.WorksheetFunction.CountA(wsSrc.Range("A" & r & ":U" & r)) = 0 Then
+            ' ignore ligne totalement vide
+        End If
+        
+        arrRow = wsSrc.Range("A" & r & ":U" & r).Value2
+        colA = CStr(wsSrc.Cells(r, "A").Value)
+        colS = LCase$(CStr(wsSrc.Cells(r, "S").Value))
+        cur = Trim$(CStr(wsSrc.Cells(r, "H").Value))
+        hasBarc = (InStr(1, colS, "barc", vbTextCompare) > 0) ' barc, barcs, barcbk, etc.
+        
+        If LCase$(Trim$(colA)) = "y" Then
+            ' A="y": archive kills A:S ; si "barc" -> aussi weekly + barclays
+            listArch.Add SliceRow(arrRow, 1, 19)          ' A:S
+            If hasBarc Then
+                listWk.Add SliceRow(arrRow, 3, 21)       ' C:U
+                AddToDict dictBarc, "barclays", arrRow   ' conserver la ligne complète (A:U)
+            End If
+        
+        ElseIf Len(Trim$(colA)) = 0 Then
+            ' A vide: weekly C:U + final par currency ; si "barc" -> aussi barclays
+            listWk.Add SliceRow(arrRow, 3, 21)           ' C:U
+            If cur = "" Then cur = "Other Currencies"
+            AddToDict dictCur, cur, arrRow               ' conserver A:U ; écriture en C:U plus tard
+            If hasBarc Then AddToDict dictBarc, "barclays", arrRow
+        
+        Else
+            ' A autre: rien, sauf si "barc" -> weekly + barclays
+            If hasBarc Then
+                listWk.Add SliceRow(arrRow, 3, 21)       ' C:U
+                AddToDict dictBarc, "barclays", arrRow
+            End If
+        End If
+    Next r
+    
+    ' Déversements
+    If listArch.Count > 0 Then AppendBlock wsArch, 6, "A", "S", listArch
+    If listWk.Count > 0 Then AppendBlock wsWk, 6, "C", "U", listWk
+    
+    ' MTN and TAPS final — append dans la section (C:U), sans Insert ligne par ligne
+    If dictCur.Count > 0 Then
+        For Each key In dictCur.Keys
+            AppendInSection wsFinal, CStr(key), dictCur(key)   ' écrit en C:U
+        Next key
+    End If
+    If dictBarc.Exists("barclays") Then
+        AppendInSection wsFinal, "barclays", dictBarc("barclays") ' écrit en C:U
+    End If
+    
+CleanExit:
+    Application.ScreenUpdating = prevScr
+    Application.Calculation = prevCalc
+    Application.EnableEvents = prevEvents
+    Exit Sub
+
+CleanFail:
+    Application.ScreenUpdating = prevScr
+    Application.Calculation = prevCalc
+    Application.EnableEvents = prevEvents
+    MsgBox "Erreur: " & Err.Description, vbCritical
+    Exit Sub
+
+ErrSheets:
+    MsgBox "Feuilles requises introuvables dans ce classeur:" & vbCrLf & _
+           "'MTN and TAPS', 'archive kills', 'WEEKLY CREDIT PPs', 'MTN and TAPS final'.", vbExclamation
+    Exit Sub
+End Sub

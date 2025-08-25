@@ -1,0 +1,216 @@
+'==========================
+' MODULE : modMailImport
+' Import today's Outlook emails (most recent per author) -> raw_mails
+'==========================
+Option Explicit
+
+' --- Outlook folder to read ---
+' If "BOND RADAR" is under Inbox (English Outlook):
+Private Const OUTLOOK_FOLDER_PATH As String = "Inbox\BOND RADAR"
+' If "BOND RADAR" is at the root of the mailbox, use:
+' Private Const OUTLOOK_FOLDER_PATH As String = "BOND RADAR"
+
+' NI sheet: authors in column D starting at D5
+Private Const NI_SHEET As String = "NI"
+Private Const NI_AUTHORS_COL As Long = 4
+Private Const NI_AUTHORS_FIRST_ROW As Long = 5
+
+' Destination sheet for raw dump
+Private Const RAW_SHEET As String = "raw_mails"
+
+'--------------------------
+' Entry point
+'--------------------------
+Public Sub ImportMails()
+    Dim wsNI As Worksheet, wsRaw As Worksheet
+    Dim authors As Object                  ' Dict (key = author lower, value = Boolean found)
+    Dim foundMail As Object                ' Dict (key = author, value = MailItem)
+    Dim olApp As Object, olNs As Object, olFolder As Object
+    Dim items As Object, rest As Object
+    Dim lastRow As Long, i As Long
+    Dim todayStart As Date, tomorrowStart As Date
+    Dim filter As String
+    Dim itm As Object
+    Dim subj As String, received As Date
+    Dim auth As Variant
+    Dim totalToFind As Long, foundCount As Long
+    
+    ' 1) Read authors from NI!D5:D...
+    On Error Resume Next
+    Set wsNI = ThisWorkbook.Sheets(NI_SHEET)
+    On Error GoTo 0
+    If wsNI Is Nothing Then
+        MsgBox "Sheet '" & NI_SHEET & "' not found.", vbExclamation
+        Exit Sub
+    End If
+    
+    Set authors = CreateObject("Scripting.Dictionary")
+    lastRow = wsNI.Cells(wsNI.Rows.Count, NI_AUTHORS_COL).End(xlUp).Row
+    For i = NI_AUTHORS_FIRST_ROW To lastRow
+        Dim a As String
+        a = Trim$(CStr(wsNI.Cells(i, NI_AUTHORS_COL).Value))
+        If Len(a) > 0 Then
+            If Not authors.Exists(LCase$(a)) Then authors.Add LCase$(a), False
+        End If
+    Next i
+    
+    If authors.Count = 0 Then
+        MsgBox "No authors in " & NI_SHEET & " (column D from row 5).", vbInformation
+        Exit Sub
+    End If
+    totalToFind = authors.Count
+    
+    ' 2) Prepare raw_mails sheet
+    Set wsRaw = EnsureRawSheet()
+    wsRaw.Cells.ClearContents
+    WriteRawHeaders wsRaw
+    
+    ' 3) Open Outlook and target folder
+    Set olApp = GetObject("", "Outlook.Application")
+    If olApp Is Nothing Then
+        On Error Resume Next
+        Set olApp = CreateObject("Outlook.Application")
+        On Error GoTo 0
+        If olApp Is Nothing Then
+            MsgBox "Cannot open Outlook.", vbCritical
+            Exit Sub
+        End If
+    End If
+    Set olNs = olApp.GetNamespace("MAPI")
+    Set olFolder = GetFolderByPath(olNs, OUTLOOK_FOLDER_PATH)
+    If olFolder Is Nothing Then
+        MsgBox "Outlook folder not found: " & OUTLOOK_FOLDER_PATH, vbCritical
+        Exit Sub
+    End If
+    
+    ' 4) Restrict to TODAY only
+    todayStart = DateSerial(Year(Date), Month(Date), Day(Date))      ' today 00:00
+    tomorrowStart = DateAdd("d", 1, todayStart)                      ' tomorrow 00:00
+    ' Outlook Restrict filter uses US format mm/dd/yyyy hh:mm
+    filter = "[ReceivedTime] >= '" & Format$(todayStart, "mm/dd/yyyy hh:nn") & "' AND [ReceivedTime] < '" & _
+                      Format$(tomorrowStart, "mm/dd/yyyy hh:nn") & "'"
+    
+    Set items = olFolder.Items
+    items.Sort "[ReceivedTime]", True                                ' newest first
+    On Error Resume Next
+    Set rest = items.Restrict(filter)
+    On Error GoTo 0
+    If rest Is Nothing Then Set rest = items                         ' fallback
+    
+    ' 5) Scan restricted items and pick the newest per author (match in Subject)
+    Set foundMail = CreateObject("Scripting.Dictionary")
+    foundCount = 0
+    
+    For Each itm In rest
+        If TypeName(itm) = "MailItem" Then
+            subj = Nz(itm.Subject)
+            received = itm.ReceivedTime
+            ' Safety if Restrict failed: enforce date window
+            If received < todayStart Or received >= tomorrowStart Then GoTo NextMail
+            
+            For Each auth In authors.Keys
+                If authors(auth) = False Then
+                    If InStr(1, subj, auth, vbTextCompare) > 0 Then
+                        ' Items are sorted newest-first: first match wins for that author
+                        foundMail.Add auth, itm
+                        authors(auth) = True
+                        foundCount = foundCount + 1
+                        Exit For
+                    End If
+                End If
+            Next auth
+            
+            If foundCount >= totalToFind Then Exit For
+        End If
+NextMail:
+    Next itm
+    
+    ' 6) Write results to raw_mails (one row per author found)
+    Dim row As Long: row = 2
+    For Each auth In authors.Keys
+        If authors(auth) = True Then
+            Dim mi As Object
+            Set mi = foundMail(auth)
+            wsRaw.Cells(row, 1).Value = auth                      ' Author (lowercase key from NI)
+            wsRaw.Cells(row, 2).Value = Nz(mi.Subject)            ' Subject
+            wsRaw.Cells(row, 3).Value = mi.ReceivedTime           ' Received datetime
+            wsRaw.Cells(row, 4).Value = Nz(mi.Body)               ' Plain Body
+            wsRaw.Cells(row, 5).Value = SenderDisplay(mi)         ' Sender
+            On Error Resume Next
+            wsRaw.Cells(row, 6).Value = mi.HTMLBody               ' HTMLBody
+            On Error GoTo 0
+            row = row + 1
+        End If
+    Next auth
+    
+    wsRaw.Columns.AutoFit
+    MsgBox "ImportMails done: " & foundCount & " email(s) imported today out of " & totalToFind & " author(s).", vbInformation
+End Sub
+
+'--------------------------
+' Helpers
+'--------------------------
+Private Function GetFolderByPath(ByVal ns As Object, ByVal folderPath As String) As Object
+    ' Accepts simple ("BOND RADAR") or hierarchical ("Inbox\BOND RADAR") paths
+    Dim parts() As String, i As Long
+    Dim f As Object
+    If Len(Trim$(folderPath)) = 0 Then Exit Function
+    parts = Split(folderPath, "\")
+    On Error Resume Next
+    Set f = ns.Folders(parts(0))
+    On Error GoTo 0
+    If f Is Nothing Then Exit Function
+    For i = 1 To UBound(parts)
+        On Error Resume Next
+        Set f = f.Folders(parts(i))
+        On Error GoTo 0
+        If f Is Nothing Then Exit Function
+    Next i
+    Set GetFolderByPath = f
+End Function
+
+Private Function EnsureRawSheet() As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Sheets(RAW_SHEET)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        ws.Name = RAW_SHEET
+    End If
+    Set EnsureRawSheet = ws
+End Function
+
+Private Sub WriteRawHeaders(ByVal ws As Worksheet)
+    ws.Range("A1").Value = "Author"
+    ws.Range("B1").Value = "Subject"
+    ws.Range("C1").Value = "Received"
+    ws.Range("D1").Value = "Body"
+    ws.Range("E1").Value = "Sender"
+    ws.Range("F1").Value = "HtmlBody"
+    ws.Range("A1:F1").Font.Bold = True
+End Sub
+
+Private Function SenderDisplay(ByVal mi As Object) As String
+    On Error Resume Next
+    If Not mi Is Nothing Then
+        If Len(mi.SenderName) > 0 Then
+            SenderDisplay = mi.SenderName
+        ElseIf Not mi.Sender Is Nothing Then
+            SenderDisplay = mi.Sender.Address
+        Else
+            SenderDisplay = ""
+        End If
+    End If
+    On Error GoTo 0
+End Function
+
+Private Function Nz(ByVal v As Variant) As String
+    On Error Resume Next
+    If IsError(v) Or IsNull(v) Or v = "" Then
+        Nz = ""
+    Else
+        Nz = CStr(v)
+    End If
+    On Error GoTo 0
+End Function

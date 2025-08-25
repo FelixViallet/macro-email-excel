@@ -1,0 +1,847 @@
+'==========================
+' MODULE : modParsing
+' Parsing des mails (raw_mails) et écriture dans NI
+'==========================
+Option Explicit
+
+' Paramètres NI
+Private Const HEADER_ROW As Long = 4   ' ligne des en-têtes dans NI
+Private Const AUTHORS_COL As Long = 4  ' colonne D = auteurs
+Private Const AUTHORS_FIRST_ROW As Long = 5
+
+'--------------------------
+' Point d'entrée
+'--------------------------
+Public Sub ParseMails()
+    Dim wsNI As Worksheet, wsRaw As Worksheet
+    Dim lastRowNI As Long, lastRowRaw As Long
+    Dim rowNI As Long, rowRaw As Long
+    Dim auteur As String
+    Dim subj As String, body As String, htmlBody As String
+    Dim mailText As String
+    Dim fieldConfigs As Object ' Dict: field -> {col, type, patterns[]}
+    Dim results As Object      ' Dict: field -> value (Variant)
+    Dim kv As Object
+
+    Set wsNI = ThisWorkbook.Sheets("NI")
+    On Error Resume Next
+    Set wsRaw = ThisWorkbook.Sheets("raw_mails")
+    On Error GoTo 0
+    If wsRaw Is Nothing Then
+        MsgBox "L’onglet 'raw_mails' est introuvable. Lance d’abord ImportMails.", vbExclamation
+        Exit Sub
+    End If
+
+    lastRowNI = wsNI.Cells(wsNI.Rows.Count, AUTHORS_COL).End(xlUp).Row
+    lastRowRaw = wsRaw.Cells(wsRaw.Rows.Count, 1).End(xlUp).Row
+
+    ' Config champs depuis en-têtes de NI (reconnaît (f) ou (d))
+    Set fieldConfigs = BuildFieldConfigs(wsNI)
+    If fieldConfigs Is Nothing Then
+        MsgBox "Aucune colonne (f) ou (d) détectée dans la ligne " & HEADER_ROW & " de 'NI'.", vbInformation
+        Exit Sub
+    End If
+
+    ' Parcours des auteurs
+    For rowNI = AUTHORS_FIRST_ROW To lastRowNI
+        auteur = Trim$(wsNI.Cells(rowNI, AUTHORS_COL).Value)
+        If auteur <> "" Then
+            rowRaw = FindMailRowForAuthor(wsRaw, auteur, lastRowRaw)
+            If rowRaw > 0 Then
+                subj = Nz(wsRaw.Cells(rowRaw, 2).Value)
+                body = Nz(wsRaw.Cells(rowRaw, 4).Value)
+                htmlBody = Nz(wsRaw.Cells(rowRaw, 6).Value)
+
+                ' Texte propre (HTML → texte) + Objet
+                mailText = GetCleanMailText(subj, body, htmlBody)
+
+                ' 1) Extraction Label:Valeur (tableau aplati / lignes "clé: valeur")
+                Set kv = BuildLabelValueMap(mailText)
+
+                ' 2) Map KV vers champs attendus
+                Set results = MapKVToExpectedFields(kv, fieldConfigs)
+
+                ' 3) Fallback regex si besoin
+                Dim missing As Object: Set missing = MissingFields(fieldConfigs, results)
+                If missing.Count > 0 Then
+                    Dim extra As Object
+                    Set extra = ExtractAllFields(mailText, fieldConfigs)
+                    Dim k As Variant
+                    For Each k In extra.Keys
+                        If Not results.Exists(k) Or Len(Trim$(CStr(results(k)))) = 0 Then
+                            results(k) = extra(k)
+                        End If
+                    Next k
+                End If
+
+                ' 4) Enrichissements dédiés
+                ' Arrangers
+                Dim arr As String: arr = ExtractArrangers(mailText)
+                If Len(arr) > 0 And fieldConfigs.Exists("arrangers") Then results("arrangers") = arr
+
+                ' Comment (green / SLB / social)
+                Dim cmt As String: cmt = ExtractComment(mailText)
+                If fieldConfigs.Exists("comment") Then results("comment") = cmt
+
+                ' Rating composite : Moody's / S&P / Fitch
+                If fieldConfigs.Exists("rating") Then
+                    Dim rateLine As String
+                    rateLine = ExtractRatingsComposite(mailText)
+                    If Len(rateLine) > 0 Then results("rating") = rateLine
+                End If
+
+                ' Structure (whitelist stricte)
+                If fieldConfigs.Exists("structure") Then
+                    Dim structVal As String
+                    structVal = ExtractStructure(mailText)
+                    If Len(structVal) > 0 Then results("structure") = structVal
+                End If
+
+                ' Maturité (tenor / NC / Perp)
+                If fieldConfigs.Exists("maturity") Then
+                    Dim matVal As String
+                    matVal = ExtractMaturity(mailText)
+                    If Len(matVal) > 0 Then results("maturity") = matVal
+                End If
+
+                ' 5) Écriture selon (f)/(d) + normalisations
+                WriteResults wsNI, rowNI, fieldConfigs, results
+            End If
+        End If
+    Next rowNI
+
+    MsgBox "Parsing terminé : mise à jour de 'NI' effectuée.", vbInformation
+End Sub
+
+'--------------------------
+' Config champs depuis en-têtes NI
+'--------------------------
+Private Function BuildFieldConfigs(wsNI As Worksheet) As Object
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    Dim lastCol As Long, col As Long
+    Dim header As String, fieldName As String, infoType As String
+
+    lastCol = wsNI.Cells(HEADER_ROW, wsNI.Columns.Count).End(xlToLeft).Column
+
+    For col = 1 To lastCol
+        header = Trim$(CStr(wsNI.Cells(HEADER_ROW, col).Value))
+        If header <> "" Then
+            fieldName = HeaderToFieldName(header)
+            infoType = GetCellTypeFromHeader(header)
+            If infoType <> "" Then
+                Dim cfg As Object: Set cfg = CreateObject("Scripting.Dictionary")
+                cfg("col") = col
+                cfg("type") = infoType
+                cfg("patterns") = DefaultPatternsForField(fieldName)
+                dict(LCase$(fieldName)) = cfg
+            End If
+        End If
+    Next col
+
+    If dict.Count = 0 Then
+        Set BuildFieldConfigs = Nothing
+    Else
+        Set BuildFieldConfigs = dict
+    End If
+End Function
+
+Private Function GetCellTypeFromHeader(ByVal header As String) As String
+    Dim h As String: h = LCase$(header)
+    If InStr(h, "(f)") > 0 Or InStr(h, "[f]") > 0 Or InStr(h, " f ") > 0 Then
+        GetCellTypeFromHeader = "f"
+    ElseIf InStr(h, "(d)") > 0 Or InStr(h, "[d]") > 0 Or InStr(h, " d ") > 0 Then
+        GetCellTypeFromHeader = "d"
+    Else
+        GetCellTypeFromHeader = ""
+    End If
+End Function
+
+Private Function HeaderToFieldName(ByVal header As String) As String
+    Dim h As String: h = Trim$(header)
+    h = Replace(h, "(f)", "", , , vbTextCompare)
+    h = Replace(h, "(d)", "", , , vbTextCompare)
+    h = Replace(h, "[f]", "", , , vbTextCompare)
+    h = Replace(h, "[d]", "", , , vbTextCompare)
+    HeaderToFieldName = Trim$(h)
+End Function
+
+Private Function FindMailRowForAuthor(wsRaw As Worksheet, ByVal auteur As String, ByVal lastRowRaw As Long) As Long
+    Dim r As Long
+    For r = 2 To lastRowRaw
+        If StrComp(Trim$(wsRaw.Cells(r, 1).Value), LCase$(auteur), vbTextCompare) = 0 Then
+            FindMailRowForAuthor = r
+            Exit Function
+        End If
+    Next r
+    FindMailRowForAuthor = 0
+End Function
+
+'--------------------------
+' Extraction par regex génériques (fallback)
+'--------------------------
+Private Function ExtractAllFields(ByVal mailText As String, ByVal fieldConfigs As Object) As Object
+    Dim results As Object: Set results = CreateObject("Scripting.Dictionary")
+    Dim key As Variant, cfg As Object, patterns As Variant
+    Dim val As String
+    For Each key In fieldConfigs.Keys
+        Set cfg = fieldConfigs(key)
+        patterns = cfg("patterns")
+        val = ExtractUsingPatterns(mailText, patterns)
+        If val <> "" Then results(key) = val
+    Next key
+    Set ExtractAllFields = results
+End Function
+
+Private Sub WriteResults(wsNI As Worksheet, ByVal rowNI As Long, ByVal fieldConfigs As Object, ByVal results As Object)
+    Dim key As Variant, cfg As Object
+    Dim col As Long, infoType As String
+    Dim value As Variant
+
+    For Each key In results.Keys
+        Set cfg = fieldConfigs(key)
+        col = CLng(cfg("col"))
+        infoType = CStr(cfg("type"))
+        value = results(key)
+
+        ' Normalisations
+        Select Case LCase(CStr(key))
+            Case "ipt"
+                value = NormalizeIPTLabel(CStr(value))                       ' ex: MS+90-95a
+            Case "nominal", "amount", "size", "montant", "book", "book size", "orderbook", "books"
+                value = MaybeNormalizeField(CStr(key), CStr(value))          ' millions
+            Case Else
+                ' nothing
+        End Select
+
+        If col > 0 Then
+            If infoType = "f" Then
+                If Trim$(CStr(wsNI.Cells(rowNI, col).Value)) = "" Then
+                    wsNI.Cells(rowNI, col).Value = value
+                End If
+            ElseIf infoType = "d" Then
+                wsNI.Cells(rowNI, col).Value = value
+            End If
+        End If
+    Next key
+End Sub
+
+Private Function DefaultPatternsForField(ByVal fieldName As String) As Variant
+    Dim f As String: f = LCase$(Trim$(fieldName))
+    Select Case f
+        Case "ipt", "ipts", "initial price thoughts", "initial price talk"
+            DefaultPatternsForField = Array( _
+                "\bIPTs?\b\s*[:=]?\s*(?:at|around|area|of)?\s*([A-Za-z€\$\-\/\+\s]*\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*(?:bp|bps))", _
+                "\bInitial\s+Price\s+(?:Thoughts|Talk)\b\s*[:=]?\s*([A-Za-z€\$\-\/\+\s]*\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*(?:bp|bps))", _
+                "\b(?:MS|mid[-\s]?swaps|T|UST|SOFR|€STR|EONIA|OAT|BTP|GGB|G|UKT)\s*\+\s*\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?\s*(?:bp|bps)\b(?![^.\r\n]*guidance)" _
+            )
+
+        Case "currency", "ccy", "devise"
+            DefaultPatternsForField = Array( _
+                "(?:Currency|Devise|Ccy)\s*[:=]\s*([A-Z]{3})", _
+                "\b([A-Z]{3})\b\s+currency" _
+            )
+
+        Case "rating", "notation"
+            DefaultPatternsForField = Array("(?:Rating|Notation)\s*[:=]\s*([A-Z]{1,3}(?:[+\-])?)")
+
+        Case "isin"
+            DefaultPatternsForField = Array("\b[A-Z]{2}[A-Z0-9]{9}\d\b")
+
+        Case "structure"
+            DefaultPatternsForField = Array()   ' handled by ExtractStructure
+
+        Case "maturity", "tenor"
+            DefaultPatternsForField = Array()   ' handled by ExtractMaturity
+
+        Case "comment", "green"
+            DefaultPatternsForField = Array("\b(green)\b", "\b(slb)\b", "\b(social)\b")
+
+        Case "nominal", "amount", "size", "montant"
+            DefaultPatternsForField = Array( _
+                "(?:Nominal|Montant|Amount|Size)\s*[:=]?\s*((?:[A-Z]{3}\s*)?[0-9][0-9\.\,]*(?:bn|mm|m))", _
+                "\b((?:EUR|USD|GBP)\s+Benchmark)\b" _
+            )
+
+        Case "book", "book size", "orderbook", "books"
+            DefaultPatternsForField = Array( _
+                "(?:Book(?:\s*size)?|Books?|Orderbook)[^:\r\n]*?(?:above|>|~|:)?\s*((?:[A-Z]{3}\s*)?[0-9][0-9\.\,]*(?:bn|mm|m))" _
+            )
+
+        Case "spread", "reoffer spread", "oas"
+            DefaultPatternsForField = Array("(?:Spread|Reoffer\s*spread|OAS)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?\s*(?:bp|bps))")
+
+        Case "arrangers", "bookrunners"
+            DefaultPatternsForField = Array()
+
+        Case Else
+            DefaultPatternsForField = Array()
+    End Select
+End Function
+
+Private Function ExtractUsingPatterns(ByVal text As String, ByVal patterns As Variant) As String
+    On Error GoTo SafeExit
+    Dim re As Object, m As Object
+    Dim i As Long
+    If IsEmpty(patterns) Then Exit Function
+    If (IsArray(patterns) = False) Then Exit Function
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False
+    re.IgnoreCase = True
+    re.MultiLine = True
+
+    For i = LBound(patterns) To UBound(patterns)
+        re.Pattern = CStr(patterns(i))
+        If re.Test(text) Then
+            Set m = re.Execute(text)(0)
+            If m.SubMatches.Count >= 1 Then
+                ExtractUsingPatterns = CleanValue(CStr(m.SubMatches(0)))
+            Else
+                ExtractUsingPatterns = CleanValue(CStr(m.Value))
+            End If
+            Exit Function
+        End If
+    Next i
+SafeExit:
+End Function
+
+'--------------------------
+' HTML → texte + KV map
+'--------------------------
+Private Function GetCleanMailText(ByVal subj As String, ByVal body As String, Optional ByVal htmlBody As String = "") As String
+    Dim t As String
+    If Len(htmlBody) > 0 Then
+        t = HtmlToText(htmlBody)
+    Else
+        t = body
+    End If
+    GetCleanMailText = Nz(subj) & vbCrLf & Nz(t)
+End Function
+
+Private Function HtmlToText(ByVal html As String) As String
+    Dim t As String
+    t = html
+    t = Replace(t, "&nbsp;", " ")
+    t = Replace(t, "&amp;", "&")
+    t = Replace(t, "&lt;", "<")
+    t = Replace(t, "&gt;", ">")
+
+    t = Replace(t, "<br>", vbCrLf, , , vbTextCompare)
+    t = Replace(t, "<br/>", vbCrLf, , , vbTextCompare)
+    t = Replace(t, "<br />", vbCrLf, , , vbTextCompare)
+
+    t = Replace(t, "</td>", vbTab, , , vbTextCompare)
+    t = Replace(t, "</th>", vbTab, , , vbTextCompare)
+
+    t = Replace(t, "</tr>", vbCrLf, , , vbTextCompare)
+    t = Replace(t, "</p>", vbCrLf, , , vbTextCompare)
+    t = Replace(t, "</div>", vbCrLf, , , vbTextCompare)
+
+    t = StripHtmlTags(t)
+    HtmlToText = CleanValue(t)
+End Function
+
+Private Function StripHtmlTags(ByVal s As String) As String
+    Dim re As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True
+    re.IgnoreCase = True
+    re.Pattern = "<[^>]+>"
+    StripHtmlTags = re.Replace(s, "")
+End Function
+
+Private Function BuildLabelValueMap(ByVal mailText As String) As Object
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    Dim aliases As Object: Set aliases = BuildLabelAliases()
+
+    Dim lines() As String, i As Long, line As String
+    Dim key As String, val As String
+
+    lines = Split(mailText, vbCrLf)
+    For i = LBound(lines) To UBound(lines)
+        line = Trim$(lines(i))
+        If Len(line) = 0 Then GoTo NextLine
+
+        If TrySplitKV(line, ":", key, val) Then
+            AddKV dict, aliases, key, val
+            GoTo NextLine
+        End If
+        If TrySplitKV(line, " - ", key, val) Then
+            AddKV dict, aliases, key, val
+            GoTo NextLine
+        End If
+        If TrySplitKV(line, " – ", key, val) Then
+            AddKV dict, aliases, key, val
+            GoTo NextLine
+        End If
+
+        If InStr(line, vbTab) > 0 Then
+            key = Trim$(Left$(line, InStr(line, vbTab) - 1))
+            val = Trim$(Mid$(line, InStrRev(line, vbTab) + 1))
+            If key <> "" And val <> "" Then AddKV dict, aliases, key, val
+            GoTo NextLine
+        End If
+
+        If ContainsMultipleSpaces(line) Then
+            key = Trim$(LeftOfDoubleSpaces(line))
+            val = Trim$(RightOfDoubleSpaces(line))
+            If key <> "" And val <> "" Then AddKV dict, aliases, key, val
+            GoTo NextLine
+        End If
+NextLine:
+    Next i
+
+    Set BuildLabelValueMap = dict
+End Function
+
+Private Sub AddKV(ByRef dict As Object, ByVal aliases As Object, ByVal rawKey As String, ByVal rawVal As String)
+    Dim stdKey As String
+    stdKey = StandardizeKey(rawKey, aliases)
+    If stdKey <> "" Then
+        If Not dict.Exists(stdKey) Then
+            dict.Add stdKey, CleanValue(rawVal)
+        Else
+            dict(stdKey) = CleanValue(rawVal)
+        End If
+    End If
+End Sub
+
+Private Function TrySplitKV(ByVal line As String, ByVal sep As String, ByRef key As String, ByRef val As String) As Boolean
+    Dim p As Long
+    p = InStr(line, sep)
+    If p > 0 Then
+        key = Trim$(Left$(line, p - 1))
+        val = Trim$(Mid$(line, p + Len(sep)))
+        If Len(key) > 0 And Len(val) > 0 Then
+            TrySplitKV = True
+            Exit Function
+        End If
+    End If
+    TrySplitKV = False
+End Function
+
+Private Function ContainsMultipleSpaces(ByVal s As String) As Boolean
+    ContainsMultipleSpaces = (InStr(s, "  ") > 0)
+End Function
+
+Private Function LeftOfDoubleSpaces(ByVal s As String) As String
+    Dim p As Long: p = InStr(s, "  ")
+    If p > 0 Then LeftOfDoubleSpaces = Left$(s, p - 1)
+End Function
+
+Private Function RightOfDoubleSpaces(ByVal s As String) As String
+    Dim p As Long: p = InStr(s, "  ")
+    If p > 0 Then RightOfDoubleSpaces = Mid$(s, p + 2)
+End Function
+
+Private Function BuildLabelAliases() As Object
+    Dim m As Object: Set m = CreateObject("Scripting.Dictionary")
+
+    ' Issuer
+    m("issuer") = "issuer": m("borrower") = "issuer": m("émetteur") = "issuer": m("emetteur") = "issuer": m("emettreur") = "issuer"
+    ' Currency
+    m("currency") = "currency": m("ccy") = "currency": m("devise") = "currency"
+    ' ISIN
+    m("isin") = "isin"
+    ' Structure
+    m("structure") = "structure"
+    ' Maturity / Tenor
+    m("maturity") = "maturity": m("tenor") = "maturity"
+    ' Comment / ESG
+    m("comment") = "comment": m("green") = "comment": m("esg") = "comment": m("sustainability") = "comment"
+    ' Nominal / Size
+    m("nominal") = "nominal": m("amount") = "nominal": m("size") = "nominal": m("deal size") = "nominal"
+    ' Book
+    m("book") = "book": m("book size") = "book": m("orderbook") = "book": m("books") = "book"
+    ' Spread
+    m("spread") = "spread": m("reoffer spread") = "spread": m("oas") = "spread"
+    ' Rating
+    m("rating") = "rating": m("notation") = "rating"
+    ' IPT labels
+    m("ipt") = "ipt": m("ipts") = "ipt": m("initial price thoughts") = "ipt": m("initial price talk") = "ipt"
+    ' Arrangers
+    m("arrangers") = "arrangers": m("bookrunners") = "arrangers": m("active bookrunners") = "arrangers": m("joint bookrunners") = "arrangers": m("jlm") = "arrangers": m("jlms") = "arrangers"
+
+    Set BuildLabelAliases = m
+End Function
+
+Private Function StandardizeKey(ByVal rawKey As String, ByVal aliases As Object) As String
+    Dim k As String
+    k = LCase$(Trim$(rawKey))
+    k = Replace(k, ".", "")
+    k = Replace(k, ":", "")
+    k = Replace(k, "-", " ")
+    k = CleanValue(k)
+    If aliases.Exists(k) Then
+        StandardizeKey = aliases(k)
+    ElseIf InStr(k, "issuer") > 0 Or InStr(k, "borrower") > 0 Or InStr(k, "émetteur") > 0 Then
+        StandardizeKey = "issuer"
+    ElseIf InStr(k, "currency") > 0 Or InStr(k, "devise") > 0 Or InStr(k, "ccy") > 0 Then
+        StandardizeKey = "currency"
+    ElseIf InStr(k, "book") > 0 Then
+        StandardizeKey = "book"
+    ElseIf InStr(k, "spread") > 0 Or InStr(k, "oas") > 0 Then
+        StandardizeKey = "spread"
+    ElseIf InStr(k, "rating") > 0 Or InStr(k, "notation") > 0 Then
+        StandardizeKey = "rating"
+    ElseIf InStr(k, "nominal") > 0 Or InStr(k, "amount") > 0 Or InStr(k, "size") > 0 Then
+        StandardizeKey = "nominal"
+    ElseIf InStr(k, "isin") > 0 Then
+        StandardizeKey = "isin"
+    ElseIf InStr(k, "green") > 0 Or InStr(k, "esg") > 0 Or InStr(k, "comment") > 0 Then
+        StandardizeKey = "comment"
+    ElseIf InStr(k, "structure") > 0 Then
+        StandardizeKey = "structure"
+    ElseIf InStr(k, "maturity") > 0 Or InStr(k, "tenor") > 0 Then
+        StandardizeKey = "maturity"
+    ElseIf InStr(k, "arranger") > 0 Or InStr(k, "bookrunner") > 0 Or InStr(k, "jlm") > 0 Then
+        StandardizeKey = "arrangers"
+    ElseIf InStr(k, "ipt") > 0 Then
+        StandardizeKey = "ipt"
+    Else
+        StandardizeKey = ""
+    End If
+End Function
+
+Private Function MapKVToExpectedFields(ByVal kv As Object, ByVal fieldConfigs As Object) As Object
+    Dim out As Object: Set out = CreateObject("Scripting.Dictionary")
+    Dim key As Variant
+    For Each key In kv.Keys
+        If fieldConfigs.Exists(LCase$(CStr(key))) Then
+            out(LCase$(CStr(key))) = kv(key)
+        End If
+    Next key
+    Set MapKVToExpectedFields = out
+End Function
+
+Private Function MissingFields(ByVal fieldConfigs As Object, ByVal results As Object) As Object
+    Dim miss As Object: Set miss = CreateObject("Scripting.Dictionary")
+    Dim k As Variant
+    For Each k In fieldConfigs.Keys
+        If Not results.Exists(k) Then miss(k) = True
+    Next k
+    Set MissingFields = miss
+End Function
+
+'--------------------------
+' ARRANGERS & COMMENT
+'--------------------------
+Private Function ExtractArrangers(ByVal mailText As String) As String
+    Dim re As Object, m As Object, matches As Object
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    Dim block As String, nm As Variant
+    Dim i As Long
+
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True: re.IgnoreCase = True: re.MultiLine = True
+    re.Pattern = "(?:\bJLMs?\b|\bjoint\s+bookrunners?\b|\bactive\s+bookrunners?\b|\bbookrunners?\b|\barrangers?\b)\s*[:\-–]\s*([^\r\n]+)"
+    Set matches = re.Execute(mailText)
+    For Each m In matches
+        block = m.SubMatches(0)
+        CollectNamesIntoDict block, dict
+    Next m
+
+    If dict.Count = 0 Then
+        re.Pattern = "(?:\bJLMs?\b|\bjoint\s+bookrunners?\b|\bactive\s+bookrunners?\b|\bbookrunners?\b|\barrangers?\b)[^\.:\r\n]*?\s*(?:are|:)\s*([^\.\r\n]+)"
+        Set matches = re.Execute(mailText)
+        For Each m In matches
+            block = m.SubMatches(0)
+            CollectNamesIntoDict block, dict
+        Next m
+    End If
+
+    If dict.Count > 0 Then
+        Dim out() As String: ReDim out(0 To dict.Count - 1)
+        i = 0
+        For Each nm In dict.Keys
+            out(i) = nm
+            i = i + 1
+        Next nm
+        ExtractArrangers = Join(out, " / ")
+    Else
+        ExtractArrangers = ""
+    End If
+End Function
+
+Private Sub CollectNamesIntoDict(ByVal block As String, ByRef dict As Object)
+    Dim tmp As String, parts As Variant, p As Variant
+    tmp = " " & block & " "
+    tmp = Replace(tmp, " and ", ", ", 1, -1, vbTextCompare)
+    tmp = Replace(tmp, "&", ",")
+    tmp = Replace(tmp, "/", ",")
+    tmp = Replace(tmp, "+", ",")
+    tmp = Replace(tmp, ";", ",")
+
+    parts = Split(tmp, ",")
+    For Each p In parts
+        Dim name As String
+        name = CleanArrangerName(p)
+        If Len(name) > 0 Then
+            If Not dict.Exists(name) Then dict.Add name, True
+        End If
+    Next p
+End Sub
+
+Private Function CleanArrangerName(ByVal s As String) As String
+    Dim t As String
+    t = Trim$(s)
+    t = Replace(t, "Active", "", 1, -1, vbTextCompare)
+    t = Replace(t, "Joint", "", 1, -1, vbTextCompare)
+    t = Replace(t, "Bookrunners", "", 1, -1, vbTextCompare)
+    t = Replace(t, "Bookrunner", "", 1, -1, vbTextCompare)
+    t = Replace(t, "JLMs", "", 1, -1, vbTextCompare)
+    t = Replace(t, "JLM", "", 1, -1, vbTextCompare)
+    t = Replace(t, "Arrangers", "", 1, -1, vbTextCompare)
+    t = Replace(t, "Arranger", "", 1, -1, vbTextCompare)
+    t = CleanValue(t)
+    If Len(t) <= 1 Then t = ""
+    CleanArrangerName = t
+End Function
+
+Private Function ExtractComment(ByVal mailText As String) As String
+    If RegexTest(mailText, "\bSLB\b|\bSustainability\s*Linked\b") Then
+        ExtractComment = "SLB": Exit Function
+    End If
+    If RegexTest(mailText, "\bsocial\b") Then
+        ExtractComment = "social": Exit Function
+    End If
+    If RegexTest(mailText, "\bgreen\b") Then
+        ExtractComment = "green": Exit Function
+    End If
+    ExtractComment = ""
+End Function
+
+Private Function RegexTest(ByVal text As String, ByVal pattern As String) As Boolean
+    Dim re As Object: Set re = CreateObject("VBScript.RegExp")
+    re.Global = False: re.IgnoreCase = True: re.MultiLine = True
+    re.Pattern = pattern
+    RegexTest = re.Test(text)
+End Function
+
+'--------------------------
+' IPT Normalisation (supprime bp/bps, ajoute "a")
+'--------------------------
+Private Function NormalizeIPTLabel(ByVal s As String) As String
+    Dim t As String
+    t = UCase(Trim$(s))
+    t = Replace(t, " ", "")
+    t = Replace(t, "BPS", "", , , vbTextCompare)
+    t = Replace(t, "BP", "", , , vbTextCompare)
+    t = Replace(t, "MID-SWAPS", "MS", , , vbTextCompare)
+    t = Replace(t, "MIDSWAPS", "MS", , , vbTextCompare)
+    If Right$(t, 1) <> "A" Then t = t & "a"
+    NormalizeIPTLabel = t
+End Function
+
+'--------------------------
+' Rating composite : Moody's / S&P / Fitch
+'--------------------------
+Private Function ExtractRatingsComposite(ByVal mailText As String) As String
+    Dim moodys As String, sp As String, fitch As String
+    moodys = GetMoodysRating(mailText)
+    sp = GetSPRating(mailText)
+    fitch = GetFitchRating(mailText)
+    If moodys = "" Then moodys = "-"
+    If sp = "" Then sp = "-"
+    If fitch = "" Then fitch = "-"
+    ExtractRatingsComposite = moodys & " / " & sp & " / " & fitch
+End Function
+
+Private Function GetMoodysRating(ByVal txt As String) As String
+    Dim re As Object, m As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True: re.IgnoreCase = True: re.MultiLine = True
+    re.Pattern = "(?:Moody['’]?s|Moodys)\s*(?:[:=\-]|\s)\s*([A-Za-z]{1,3}\d?(?:[+\-])?)"
+    If re.Test(txt) Then
+        Set m = re.Execute(txt)(0)
+        GetMoodysRating = CleanRatingToken(m.SubMatches(0), True)
+    End If
+End Function
+
+Private Function GetSPRating(ByVal txt As String) As String
+    Dim re As Object, m As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True: re.IgnoreCase = True: re.MultiLine = True
+    re.Pattern = "(?:S\s*&\s*P|S&P|Standard\s*&\s*Poor['’]?s)\s*(?:[:=\-]|\s)\s*([A-Z]{1,3}(?:[+\-])?)"
+    If re.Test(txt) Then
+        Set m = re.Execute(txt)(0)
+        GetSPRating = CleanRatingToken(m.SubMatches(0), False)
+    End If
+End Function
+
+Private Function GetFitchRating(ByVal txt As String) As String
+    Dim re As Object, m As Object
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = True: re.IgnoreCase = True: re.MultiLine = True
+    re.Pattern = "Fitch\s*(?:[:=\-]|\s)\s*([A-Z]{1,3}(?:[+\-])?)"
+    If re.Test(txt) Then
+        Set m = re.Execute(txt)(0)
+        GetFitchRating = CleanRatingToken(m.SubMatches(0), False)
+    End If
+End Function
+
+Private Function CleanRatingToken(ByVal s As String, ByVal allowMoodyAlpha As Boolean) As String
+    Dim t As String
+    t = Trim$(s)
+    If allowMoodyAlpha Then
+        If Not t Like "[Aa][Aa][a1-3]" And Not t Like "[Bb][Aa][a1-3]" And Not t Like "[A-Za-z][1-3]" Then
+            t = UCase$(t)
+        End If
+    Else
+        t = UCase$(t)
+    End If
+    CleanRatingToken = t
+End Function
+
+'--------------------------
+' Structure (whitelist stricte)
+'--------------------------
+Private Function ExtractStructure(ByVal txt As String) As String
+    Dim t As String: t = " " & LCase$(txt) & " "
+    ' Priorité du plus spécifique au plus générique
+    If ContainsAny(t, Array("senior non-preferred", "non-preferred senior")) Then ExtractStructure = "Senior Unsecured": Exit Function
+    If ContainsAny(t, Array("senior preferred")) Then ExtractStructure = "Senior Unsecured": Exit Function
+
+    If ContainsAny(t, Array("senior secured", "secured senior")) Then ExtractStructure = "Senior Secured": Exit Function
+    If ContainsAny(t, Array("covered bond", "pfandbrief", "obligations foncières", "obligations foncieres", "cédulas", "cedulas", "obg", "covd")) Then ExtractStructure = "Covered": Exit Function
+    If ContainsAny(t, Array("additional tier 1", "at1")) Then ExtractStructure = "AT1": Exit Function
+    If ContainsAny(t, Array("tier 2", "tier ii", "t2")) Then ExtractStructure = "Tier 2": Exit Function
+    If ContainsAny(t, Array("tier 1", "tier i", "t1")) Then ExtractStructure = "Tier 1": Exit Function
+    If ContainsAny(t, Array("hybrid capital", "corporate hybrid", "hybrid")) Then ExtractStructure = "Hybrid": Exit Function
+    If ContainsAny(t, Array("mrel-eligible", "eligible liabilities", "mrel")) Then ExtractStructure = "MREL": Exit Function
+    If ContainsAny(t, Array("fa backed", "fabn")) Then ExtractStructure = "FABN": Exit Function
+    If ContainsAny(t, Array("senior unsecured", "unsecured")) Then ExtractStructure = "Senior Unsecured": Exit Function
+    If ContainsAny(t, Array("senior")) Then ExtractStructure = "Senior": Exit Function
+
+    ExtractStructure = ""
+End Function
+
+Private Function ContainsAny(ByVal hay As String, ByVal needles As Variant) As Boolean
+    Dim i As Long
+    For i = LBound(needles) To UBound(needles)
+        If InStr(1, hay, " " & LCase$(CStr(needles(i))) & " ", vbTextCompare) > 0 Or _
+           InStr(1, hay, LCase$(CStr(needles(i))), vbTextCompare) > 0 Then
+            ContainsAny = True: Exit Function
+        End If
+    Next i
+End Function
+
+'--------------------------
+' Maturité (tenor / NC / Perp)
+'--------------------------
+Private Function ExtractMaturity(ByVal txt As String) As String
+    Dim re As Object, m As Object
+
+    ' 1) Perp / Perpetual / Perp NCx
+    Set re = CreateObject("VBScript.RegExp")
+    re.Global = False: re.IgnoreCase = True
+    re.Pattern = "\bPerp(?:etual)?\s*(?:NC\s*\d+)?\b"
+    If re.Test(txt) Then
+        ExtractMaturity = Trim$(re.Execute(txt)(0).Value)
+        ExtractMaturity = Replace(ExtractMaturity, "  ", " ")
+        Exit Function
+    End If
+
+    ' 2) Callable : 6NC5 / 10 NC 3 / 5nc6
+    re.Pattern = "\b(\d+)\s*NC\s*(\d+)\b"
+    If re.Test(UCase$(txt)) Then
+        Set m = re.Execute(UCase$(txt))(0)
+        ExtractMaturity = CStr(m.SubMatches(0)) & "NC" & CStr(m.SubMatches(1))
+        Exit Function
+    End If
+    ' version sans espace : 6NC5
+    re.Pattern = "\b(\d+)NC(\d+)\b"
+    If re.Test(UCase$(txt)) Then
+        Set m = re.Execute(UCase$(txt))(0)
+        ExtractMaturity = CStr(m.SubMatches(0)) & "NC" & CStr(m.SubMatches(1))
+        Exit Function
+    End If
+
+    ' 3) Plain vanilla : 5y / 5-year / 10 yr / 7 years  → renvoyer juste le nombre
+    Dim re2 As Object
+    Set re2 = CreateObject("VBScript.RegExp")
+    re2.Global = False: re2.IgnoreCase = True
+    re2.Pattern = "\b(\d+)\s*(?:y|yr|year|years)\b"
+    If re2.Test(txt) Then
+        ExtractMaturity = CStr(CLng(re2.Execute(txt)(0).SubMatches(0)))
+        Exit Function
+    End If
+
+    ' 4) Plage 5-7y → 5 (borne courte) si pas de NC/Perp
+    re2.Pattern = "\b(\d+)\s*[-–]\s*(\d+)\s*(?:y|yr|year|years)\b"
+    If re2.Test(txt) Then
+        ExtractMaturity = CStr(CLng(re2.Execute(txt)(0).SubMatches(0)))
+        Exit Function
+    End If
+
+    ExtractMaturity = ""
+End Function
+
+'--------------------------
+' Normalisation montants → millions (Nominal / Book)
+'--------------------------
+Private Function NormalizeToMillions(ByVal raw As String) As Variant
+    Dim t As String, num As String, unit As String
+    Dim val As Double
+
+    If Len(raw) = 0 Then Exit Function
+
+    t = UCase(Trim(raw))
+    If Len(t) >= 4 And Mid$(t, 4, 1) = " " And Left$(t, 3) Like "[A-Z][A-Z][A-Z]" Then
+        t = Trim(Mid$(t, 4))
+    End If
+
+    t = Replace(t, ",", "")
+    t = Replace(t, " ", "")
+
+    If Right$(t, 2) = "BN" Then
+        unit = "BN": num = Left$(t, Len(t) - 2)
+    ElseIf Right$(t, 2) = "MM" Then
+        unit = "MM": num = Left$(t, Len(t) - 2)
+    ElseIf Right$(t, 1) = "M" Then
+        unit = "M": num = Left$(t, Len(t) - 1)
+    Else
+        NormalizeToMillions = raw
+        Exit Function
+    End If
+
+    On Error Resume Next
+    val = CDbl(num)
+    On Error GoTo 0
+
+    If unit = "BN" Then val = val * 1000#
+    NormalizeToMillions = val
+End Function
+
+Private Function MaybeNormalizeField(ByVal fieldKey As String, ByVal value As String) As Variant
+    Select Case LCase(fieldKey)
+        Case "nominal", "amount", "size", "montant", "book", "book size", "orderbook", "books"
+            MaybeNormalizeField = NormalizeToMillions(value)
+        Case Else
+            MaybeNormalizeField = value
+    End Select
+End Function
+
+'--------------------------
+' Utilitaires simples
+'--------------------------
+Private Function CleanValue(ByVal s As String) As String
+    Dim t As String
+    t = Trim$(s)
+    t = Replace(t, vbCr, " ")
+    t = Replace(t, vbLf, " ")
+    Do While InStr(t, "  ") > 0
+        t = Replace(t, "  ", " ")
+    Loop
+    CleanValue = t
+End Function
+
+Private Function Nz(ByVal v As Variant) As String
+    On Error Resume Next
+    If IsError(v) Or IsNull(v) Or v = "" Then
+        Nz = ""
+    Else
+        Nz = CStr(v)
+    End If
+    On Error GoTo 0
+End Function
